@@ -1,0 +1,169 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <Arduino.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// Wi-Fi credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// MQTT Broker
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP";
+const int mqtt_port = 1883;
+
+// LoRa
+#define LORA_SCK 5    // GPIO5  -- SX1278's SCK
+#define LORA_MISO 19  // GPIO19 -- SX1278's MISO
+#define LORA_MOSI 27  // GPIO27 -- SX1278's MOSI
+#define LORA_SS 18    // GPIO18 -- SX1278's CS
+#define LORA_RST 14   // GPIO14 -- SX1278's RESET
+#define LORA_DI0 26   // GPIO26 -- SX1278's IRQ(Interrupt Request)
+#define LORA_BAND 433E6
+
+// Initialize LoRa
+void initLoRa() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DI0);
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println("LoRa init failed. Check your connections.");
+    while (1);
+  }
+}
+
+// Wi-Fi client
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Function to reconnect to MQTT
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.println("Attempting MQTT connection...");
+    if (mqttClient.connect("ESP32Client")) {
+      Serial.println("Connected to MQTT Broker");
+    } else {
+      Serial.print("MQTT connection failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Retrying in 5 seconds...");
+      delay(5000);
+    }
+  }
+}
+
+// Function to send data via LoRa
+void sendLoRa(String data) {
+  LoRa.beginPacket();
+  LoRa.print(data);
+  LoRa.endPacket();
+}
+
+// Function to measure air quality
+int measureAirQuality() {
+  // Read values from air quality sensors
+  int air_quality_value_1 = analogRead(AIR_QUALITY_SENSOR_PIN_1);
+  int air_quality_value_2 = analogRead(AIR_QUALITY_SENSOR_PIN_2);
+
+  // Process air quality values and trigger alert if needed
+  // Example:
+  if (air_quality_value_1 > AIR_QUALITY_THRESHOLD || air_quality_value_2 > AIR_QUALITY_THRESHOLD) {
+    Serial.println("Poor air quality detected!");
+    // Implement action (e.g., send alert)
+  }
+
+}
+
+// Function to measure current using Hall effect sensor
+float measureCurrent() {
+    // Read current sensor value
+  int current_sensor_value = readCurrentSensor();
+
+  // Check if current value changes significantly
+  if (abs(current_sensor_value - prev_sensor_value) > CURRENT_SENSOR_THRESHOLD) {
+    Serial.println("Significant current change detected!");
+    // Implement action (e.g., send alert)
+  }
+
+  // Store current sensor value for comparison in the next iteration
+  prev_sensor_value = current_sensor_value;
+
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // Initialize LoRa
+  initLoRa();
+
+  // Set MQTT server and port
+  mqttClient.setServer(mqtt_server, mqtt_port);
+}
+
+void loop() {
+  // Reconnect to MQTT if necessary
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  // Capture frames from the camera
+  camera_fb_t* fb1 = esp_camera_fb_get();
+  delay(100); // Delay for stability between frames
+  camera_fb_t* fb2 = esp_camera_fb_get();
+
+  if (fb1 && fb2) {
+    // Convert frame buffers to OpenCV Mat
+    Mat frame1(fb1->height, fb1->width, CV_8UC3, fb1->buf);
+    Mat frame2(fb2->height, fb2->width, CV_8UC3, fb2->buf);
+
+    // Convert frames to grayscale
+    Mat gray1, gray2;
+    cvtColor(frame1, gray1, COLOR_BGR2GRAY);
+    cvtColor(frame2, gray2, COLOR_BGR2GRAY);
+
+    // Calculate absolute difference between frames
+    Mat diff;
+    absdiff(gray1, gray2, diff);
+
+    // Thresholding to extract significant changes
+    Mat thresholded;
+    threshold(diff, thresholded, 30, 255, THRESH_BINARY);
+
+    // Count non-zero pixels to detect flicker
+    int flicker_count = countNonZero(thresholded);
+
+    // Define flicker threshold
+    int flicker_threshold = 10000;
+
+    // Check if flicker count exceeds threshold
+    if (flicker_count > flicker_threshold) {
+      Serial.println("Flicker detected!");
+      // Send flicker alert via MQTT
+      mqttClient.publish("alerts", "Flicker detected!");
+      // Send flicker alert via LoRa
+      sendLoRa("Flicker detected!");
+    }
+
+    // Release frame buffers
+    esp_camera_fb_return(fb1);
+    esp_camera_fb_return(fb2);
+  }
+
+  // Measure air quality
+  int airQuality = measureAirQuality();
+  // Publish air quality data via MQTT
+  mqttClient.publish("air_quality", String(airQuality));
+
+  // Measure current
+  float current = measureCurrent();
+  // Publish current data via MQTT
+  mqttClient.publish("current", String(current));
+}
